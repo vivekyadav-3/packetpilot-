@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Production Builds
+dist/
+client/dist/
+
+# Environment and Secrets
+.env
+.env.local
+*.log
+
+# Diagnostic History Data
+data/
+*.sqlite
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
