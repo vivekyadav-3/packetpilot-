@@ -8,6 +8,7 @@ import { checkHttp } from "../diagnostics/http.js";
 import { inspectTls } from "../diagnostics/tls.js";
 import { explainReportWithOllama, checkOllamaAvailability } from "../ai/ollama.js";
 import { DiagnosticHistory } from "../storage/history.js";
+import { validateTarget, securityLimiter } from "../security/target-policy.js";
 
 export const apiRouter = Router();
 
@@ -24,8 +25,25 @@ function getSingleQueryString(param: unknown): string | undefined {
   return undefined;
 }
 
-// Full Diagnostic
+// Full Diagnostic with Security Hardening
 apiRouter.post("/diagnose", async (req: Request, res: Response) => {
+  const clientIp = req.ip || req.socket.remoteAddress || "127.0.0.1";
+
+  // Rate Limiting Check
+  const rateCheck = securityLimiter.checkRateLimit(clientIp);
+  if (!rateCheck.allowed) {
+    return res.status(429).json({
+      error: `Rate limit exceeded. Please wait ${rateCheck.retryAfterSeconds} seconds before launching more diagnostics.`,
+    });
+  }
+
+  // Concurrency Guard
+  if (!securityLimiter.acquireConcurrency()) {
+    return res.status(503).json({
+      error: "Server diagnostic concurrency limit reached. Please retry in a few moments.",
+    });
+  }
+
   try {
     const parsed = DiagnoseSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -33,7 +51,21 @@ apiRouter.post("/diagnose", async (req: Request, res: Response) => {
     }
 
     const { host, port, url } = parsed.data;
-    const report = await runFullDiagnostic({ host, port, url });
+
+    // Security & Target Policy Validation
+    const validation = validateTarget(host, port, url);
+    if (!validation.allowed) {
+      return res.status(403).json({
+        error: "Security Policy Violation",
+        reason: validation.rejectionReason,
+      });
+    }
+
+    const report = await runFullDiagnostic({
+      host: validation.sanitizedHost || host,
+      port: validation.sanitizedPort ?? port,
+      url: validation.sanitizedUrl ?? url,
+    });
 
     // Save to history
     const historyItem = await DiagnosticHistory.saveRun(report);
@@ -44,6 +76,8 @@ apiRouter.post("/diagnose", async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
+  } finally {
+    securityLimiter.releaseConcurrency();
   }
 });
 

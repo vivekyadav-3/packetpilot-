@@ -50,7 +50,7 @@ export function evaluateDiagnosticRules(
       {
         probeId: "tcp",
         status: "FAILED",
-        observation: `TCP handshake to ${host}:${port} received an immediate RST packet (ECONNREFUSED).`,
+        observation: `TCP connection to ${host}:${port} actively refused by host or OS kernel (ECONNREFUSED).`,
         rawCode: "ECONNREFUSED",
       },
     ];
@@ -60,9 +60,9 @@ export function evaluateDiagnosticRules(
       ruleId,
       severity: "CRITICAL",
       confidence: "MEDIUM",
-      confidenceRationale: "Evidence is conflicting: a process holds the listening socket, but the TCP stack refused the connection. This typically indicates an interface mismatch (IPv4 vs IPv6), connection backlog saturation, or local security software blocking the loopback.",
+      confidenceRationale: "Evidence is conflicting: a process holds the listening socket in the OS table, but the TCP stack refused the connection. This typically indicates an interface mismatch (IPv4 vs IPv6), connection backlog saturation, or local security software blocking the loopback.",
       title: `Conflicting Evidence: Process Listening but Connection Refused on ${port}`,
-      inferredCause: `Application '${proc?.processName}' (PID ${proc?.pid}) is listening on ${proc?.localAddress}, but rejected connection from target '${host}'. Common cause is binding to '127.0.0.1' while client attempts '::1' (or vice-versa), or the OS firewall RST filter.`,
+      inferredCause: `Application '${proc?.processName}' (PID ${proc?.pid}) is listening on ${proc?.localAddress}, but rejected connection from target '${host}'. Common cause is binding to '127.0.0.1' while client attempts '::1' (or vice-versa), or local endpoint protection.`,
       observedFacts: structuredEvidence.map((e) => e.observation),
       structuredEvidence,
       unavailableChecks,
@@ -102,7 +102,7 @@ export function evaluateDiagnosticRules(
       {
         probeId: "tcp",
         status: "FAILED",
-        observation: `TCP handshake to ${host}:${port} received an immediate RST packet from the OS kernel (ECONNREFUSED).`,
+        observation: `TCP connection to ${host}:${port} actively refused by host or OS kernel (ECONNREFUSED).`,
         rawCode: "ECONNREFUSED",
       },
     ];
@@ -120,7 +120,7 @@ export function evaluateDiagnosticRules(
       unavailableChecks,
       recommendedAction: `Start your application (e.g., 'npm run dev' or 'node server.js') and check the terminal for uncaught startup errors or port configuration mismatches.`,
       verification: `Re-run PacketPilot to confirm that an active socket enters LISTENING state and completes the TCP handshake.`,
-      falsificationCondition: `A process appearing in the socket table or accepting a TCP SYN-ACK handshake immediately disproves this diagnosis.`,
+      falsificationCondition: `A process appearing in the socket table or accepting a TCP connection immediately disproves this diagnosis.`,
       code: ruleId,
       evidence: structuredEvidence.map((e) => e.observation).join("; "),
       likelyCause: `Backend application is not running or crashed.`,
@@ -141,7 +141,7 @@ export function evaluateDiagnosticRules(
       {
         probeId: "tcp",
         status: "FAILED",
-        observation: `TCP connection to ${host}:${port} was rejected with ECONNREFUSED (RST packet).`,
+        observation: `TCP connection to ${host}:${port} was rejected with ECONNREFUSED.`,
         rawCode: "ECONNREFUSED",
       },
     ];
@@ -151,7 +151,7 @@ export function evaluateDiagnosticRules(
       ruleId,
       severity: "CRITICAL",
       confidence: "MEDIUM",
-      confidenceRationale: "The TCP handshake was refused by the target host. However, local process inspection was skipped (remote target or unprivileged host), so the process state cannot be verified directly.",
+      confidenceRationale: "The TCP connection was refused by the target host. However, local process inspection was skipped (remote target or unprivileged host), so the process state cannot be verified directly.",
       title: `Connection Refused by Remote Host (${host}:${port})`,
       inferredCause: `The remote host at ${host} is reachable, but refused connection on port ${port}. The remote daemon may be stopped or bound to loopback only on that host.`,
       observedFacts: structuredEvidence.map((e) => e.observation),
@@ -180,7 +180,7 @@ export function evaluateDiagnosticRules(
       {
         probeId: "tcp",
         status: "FAILED",
-        observation: `TCP connection to ${host}:${port} timed out after ${probes.tcp.durationMs}ms without receiving SYN-ACK or RST.`,
+        observation: `TCP connection to ${host}:${port} timed out after ${probes.tcp.durationMs}ms without receiving a response.`,
         rawCode: "ETIMEDOUT",
       },
     ];
@@ -197,19 +197,19 @@ export function evaluateDiagnosticRules(
       ruleId,
       severity: "CRITICAL",
       confidence: "HIGH",
-      confidenceRationale: "Packets were transmitted but silently dropped with no response. This is a definitive signature of a firewall, security group, or dropped network route, rather than a closed port (which returns RST).",
+      confidenceRationale: "Packets were transmitted but received no response before timeout. This differs from connection refusal (which immediately returns ECONNREFUSED).",
       title: `TCP Connection Timed Out to ${host}:${port}`,
-      inferredCause: `A firewall (Windows Defender, iptables, or cloud security group) or network routing fault is silently dropping TCP packets to port ${port}.`,
+      inferredCause: `Connection attempt timed out without response. Likely causes include a packet-filtering firewall, network routing failure, an unresponsive or offline host, or network packet drop.`,
       observedFacts: structuredEvidence.map((e) => e.observation),
       structuredEvidence,
       unavailableChecks,
-      recommendedAction: `Inspect Windows Defender Firewall or security group inbound rules to allow TCP traffic on port ${port}.`,
+      recommendedAction: `Inspect local firewall rules, network routing, or cloud security group inbound rules for port ${port}.`,
       verification: `Test port reachability via PowerShell 'Test-NetConnection -ComputerName ${host} -Port ${port}'.`,
-      falsificationCondition: `Receiving an immediate RST or completing the handshake disproves a packet-dropping firewall.`,
+      falsificationCondition: `Receiving an immediate ECONNREFUSED or completing the handshake disproves an unroutable/packet-dropping condition.`,
       code: ruleId,
       evidence: `Connection timed out after ${probes.tcp.durationMs}ms.`,
-      likelyCause: `Firewall or routing filter dropping packets.`,
-      suggestedFix: `Check firewall rules on port ${port}.`,
+      likelyCause: `Packet-dropping firewall, routing failure, or offline host.`,
+      suggestedFix: `Check firewall and network routing for port ${port}.`,
       verificationStep: `Test connection with Test-NetConnection.`,
     });
   }
@@ -337,6 +337,50 @@ export function evaluateDiagnosticRules(
       likelyCause: `Route not registered.`,
       suggestedFix: `Verify route definitions.`,
       verificationStep: `Retry request with valid path.`,
+    });
+  }
+
+  // =========================================================================
+  // SCENARIO 7b: HTTP 5xx Application / Gateway Error
+  // Distinguishes transport success from application server crashes
+  // =========================================================================
+  if (probes.http?.statusCode && probes.http.statusCode >= 500) {
+    const ruleId = "RULE_HTTP_SERVER_ERROR";
+    rulesFired.push(ruleId);
+
+    const isGateway = probes.http.statusCode === 502 || probes.http.statusCode === 504;
+    const structuredEvidence: StructuredEvidence[] = [
+      {
+        probeId: "http",
+        status: "SUCCESS",
+        observation: `HTTP server returned error status ${probes.http.statusCode} (${probes.http.statusText || "Server Error"}).`,
+        rawCode: String(probes.http.statusCode),
+      },
+    ];
+
+    findings.push({
+      id: `incident-${ruleId}`,
+      ruleId,
+      severity: "CRITICAL",
+      confidence: "HIGH",
+      confidenceRationale: "Network transport connection succeeded, but the application server returned a 5xx fatal error code.",
+      title: `Application Server Error (HTTP ${probes.http.statusCode})`,
+      inferredCause: isGateway
+        ? `The upstream reverse proxy (e.g. NGINX) is running, but cannot communicate with the backend application daemon.`
+        : `An unhandled exception or crash occurred within the backend request handler code.`,
+      observedFacts: structuredEvidence.map((e) => e.observation),
+      structuredEvidence,
+      unavailableChecks,
+      recommendedAction: isGateway
+        ? `Verify that the upstream backend daemon is running and reachable by the proxy.`
+        : `Inspect application server logs and stack traces for uncaught runtime exceptions.`,
+      verification: `Send a request to the endpoint after resolving the application exception.`,
+      falsificationCondition: `Receiving HTTP 200 disproves an application crash.`,
+      code: ruleId,
+      evidence: `HTTP ${probes.http.statusCode} returned.`,
+      likelyCause: `Unhandled application exception or gateway timeout.`,
+      suggestedFix: `Inspect application logs.`,
+      verificationStep: `Retry request.`,
     });
   }
 

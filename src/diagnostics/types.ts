@@ -20,9 +20,17 @@ export interface DnsRecordResult {
   address: string;
 }
 
+export interface DnsQueryOutcome {
+  status: "SUCCESS" | "NODATA" | "FAILED";
+  records: string[];
+  error?: string;
+}
+
 export interface DnsProbeResult extends BaseProbeResult {
   hostname: string;
   records: DnsRecordResult[];
+  ipv4Query?: DnsQueryOutcome;
+  ipv6Query?: DnsQueryOutcome;
   errorType?: "ENOTFOUND" | "ETIMEOUT" | "EAI_AGAIN" | "UNKNOWN";
 }
 
@@ -47,6 +55,8 @@ export interface HttpProbeResult extends BaseProbeResult {
   statusText?: string;
   headers?: Record<string, string>;
   ttfbMs?: number;
+  totalDurationMs?: number;
+  isApplicationError?: boolean;
 }
 
 export interface TlsProbeResult extends BaseProbeResult {
