@@ -1,5 +1,6 @@
 import { runFullDiagnostic } from "./engine/report.js";
 import { explainReportWithOllama } from "./ai/ollama.js";
+import { validateTarget } from "./security/target-policy.js";
 
 async function main() {
   const targetHost = process.argv[2] || "localhost";
@@ -11,9 +12,15 @@ async function main() {
   console.log(` Target: ${targetHost}:${targetPort}`);
   console.log(`=============================================================\n`);
 
+  const validation = validateTarget(targetHost, targetPort);
+  if (!validation.allowed) {
+    console.error(`❌ Security Policy Error: ${validation.rejectionReason}\n`);
+    process.exit(1);
+  }
+
   const report = await runFullDiagnostic({
-    host: targetHost,
-    port: targetPort,
+    host: validation.sanitizedHost || targetHost,
+    port: validation.sanitizedPort ?? targetPort,
   });
 
   console.log("PROBES EXECUTED:");

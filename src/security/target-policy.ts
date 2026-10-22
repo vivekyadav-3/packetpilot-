@@ -1,19 +1,30 @@
-import { z } from "zod";
+import * as net from "node:net";
+import * as dns from "node:dns/promises";
 
 /**
- * Target Validation & Security Policy
+ * Enterprise-Grade Target Validation & Anti-SSRF Security Engine
  * 
- * Prevents SSRF attacks, cloud metadata exfiltration (169.254.169.254),
- * dangerous protocol injection, and denial-of-service via malformed targets.
+ * Protects against:
+ * - Cloud metadata exfiltration (AWS/GCP/Azure link-local IPs and DNS)
+ * - Prohibited protocol schemes (file://, gopher://, ftp://)
+ * - IPv6 and IPv4 link-local and documentation IP probing
+ * - DNS rebinding attacks to blocked internal ranges
+ * - Port scanning abuse via strict rate limiting and concurrency limits
  */
 
-// Blocked cloud metadata & reserved dangerous IPs
-const BLOCKED_HOSTS = new Set([
-  "169.254.169.254",         // AWS/GCP/Azure link-local instance metadata
-  "metadata.google.internal", // GCP metadata DNS
-  "instance-data",            // AWS legacy metadata alias
-  "0.0.0.0",                  // Direct bind-all address target
+// Cloud metadata endpoints and host aliases
+const CLOUD_METADATA_HOSTS = new Set([
+  "169.254.169.254",
+  "metadata.google.internal",
+  "metadata",
+  "instance-data",
+  "fd00:ec2::254", // AWS IPv6 metadata
 ]);
+
+export interface TargetPolicyOptions {
+  allowLocalhost?: boolean;       // default: true (Developer tool needs to test localhost)
+  allowPrivateNetworks?: boolean; // default: true for local dev, false if deployed publicly
+}
 
 export interface TargetValidationResult {
   allowed: boolean;
@@ -23,10 +34,52 @@ export interface TargetValidationResult {
   rejectionReason?: string;
 }
 
+/**
+ * Check if an IP address belongs to link-local cloud metadata (AWS/GCP/Azure)
+ */
+export function isCloudMetadataIp(ip: string): boolean {
+  if (ip === "169.254.169.254" || ip === "fd00:ec2::254") return true;
+  if (ip.startsWith("169.254.")) return true; // Entire IPv4 link-local range
+  if (ip.toLowerCase().startsWith("fe80:")) return true; // IPv6 link-local
+  return false;
+}
+
+/**
+ * Check if an IP address belongs to private RFC1918 or loopback ranges
+ */
+export function isPrivateOrLoopbackIp(ip: string): { isLoopback: boolean; isPrivate: boolean } {
+  // Loopback IPv4 & IPv6
+  if (ip === "127.0.0.1" || ip === "::1" || ip.startsWith("127.")) {
+    return { isLoopback: true, isPrivate: true };
+  }
+
+  // IPv4 Private Ranges (RFC 1918 & CGNAT)
+  const parts = ip.split(".").map(Number);
+  if (parts.length === 4 && parts.every((n) => !isNaN(n) && n >= 0 && n <= 255)) {
+    if (parts[0] === 10) return { isLoopback: false, isPrivate: true }; // 10.0.0.0/8
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return { isLoopback: false, isPrivate: true }; // 172.16.0.0/12
+    if (parts[0] === 192 && parts[1] === 168) return { isLoopback: false, isPrivate: true }; // 192.168.0.0/16
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return { isLoopback: false, isPrivate: true }; // 100.64.0.0/10 (CGNAT)
+    if (parts[0] === 0) return { isLoopback: false, isPrivate: true }; // 0.0.0.0/8
+  }
+
+  // IPv6 Unique Local Address (fc00::/7)
+  const lower = ip.toLowerCase();
+  if (lower.startsWith("fc") || lower.startsWith("fd")) {
+    return { isLoopback: false, isPrivate: true };
+  }
+
+  return { isLoopback: false, isPrivate: false };
+}
+
+/**
+ * Synchronous target validation (URL scheme, host blacklist, port ranges)
+ */
 export function validateTarget(
   hostInput: string,
   portInput?: number,
-  urlInput?: string
+  urlInput?: string,
+  options: TargetPolicyOptions = { allowLocalhost: true, allowPrivateNetworks: true }
 ): TargetValidationResult {
   // 1. URL Protocol & Structure Validation
   if (urlInput) {
@@ -34,7 +87,7 @@ export function validateTarget(
     try {
       parsedUrl = new URL(urlInput);
     } catch {
-      return { allowed: false, rejectionReason: "Invalid URL format." };
+      return { allowed: false, rejectionReason: "Invalid URL structure." };
     }
 
     if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
@@ -44,12 +97,31 @@ export function validateTarget(
       };
     }
 
-    // Host extraction from URL
-    const hostFromUrl = parsedUrl.hostname.toLowerCase();
-    if (BLOCKED_HOSTS.has(hostFromUrl) || hostFromUrl.startsWith("169.254.")) {
+    const hostFromUrl = parsedUrl.hostname.toLowerCase().replace(/^\[|\]$/g, ""); // strip IPv6 brackets
+
+    // Cloud metadata block (ALWAYS blocked)
+    if (CLOUD_METADATA_HOSTS.has(hostFromUrl) || isCloudMetadataIp(hostFromUrl)) {
       return {
         allowed: false,
-        rejectionReason: `Target host '${hostFromUrl}' is blocked by security policy (Cloud Metadata / Link-Local IP).`,
+        rejectionReason: `Target '${hostFromUrl}' is blocked by security policy (Cloud Metadata / Link-Local IP).`,
+      };
+    }
+
+    // Loopback / Private policy check
+    const ipCheck = isPrivateOrLoopbackIp(hostFromUrl);
+    const isLocalhostDomain = hostFromUrl === "localhost" || hostFromUrl.endsWith(".localhost");
+
+    if ((ipCheck.isLoopback || isLocalhostDomain) && !options.allowLocalhost) {
+      return {
+        allowed: false,
+        rejectionReason: `Loopback access to '${hostFromUrl}' is disabled by server security policy.`,
+      };
+    }
+
+    if (ipCheck.isPrivate && !ipCheck.isLoopback && !options.allowPrivateNetworks) {
+      return {
+        allowed: false,
+        rejectionReason: `Access to private network address '${hostFromUrl}' is restricted.`,
       };
     }
 
@@ -68,15 +140,32 @@ export function validateTarget(
   }
 
   // 2. Direct Hostname Validation
-  const host = hostInput.trim().toLowerCase();
+  const host = hostInput.trim().toLowerCase().replace(/^\[|\]$/g, "");
   if (!host) {
     return { allowed: false, rejectionReason: "Target host cannot be empty." };
   }
 
-  if (BLOCKED_HOSTS.has(host) || host.startsWith("169.254.")) {
+  if (CLOUD_METADATA_HOSTS.has(host) || isCloudMetadataIp(host)) {
     return {
       allowed: false,
       rejectionReason: `Target host '${host}' is blocked by security policy (Cloud Metadata / Link-Local IP).`,
+    };
+  }
+
+  const ipCheck = isPrivateOrLoopbackIp(host);
+  const isLocalhostDomain = host === "localhost" || host.endsWith(".localhost");
+
+  if ((ipCheck.isLoopback || isLocalhostDomain) && !options.allowLocalhost) {
+    return {
+      allowed: false,
+      rejectionReason: `Loopback access to '${host}' is disabled by server security policy.`,
+    };
+  }
+
+  if (ipCheck.isPrivate && !ipCheck.isLoopback && !options.allowPrivateNetworks) {
+    return {
+      allowed: false,
+      rejectionReason: `Access to private network address '${host}' is restricted.`,
     };
   }
 
@@ -85,7 +174,7 @@ export function validateTarget(
     if (!Number.isInteger(portInput) || portInput < 1 || portInput > 65535) {
       return {
         allowed: false,
-        rejectionReason: `Port ${portInput} is outside the valid TCP range (1 - 65535).`,
+        rejectionReason: `Port ${portInput} is outside the valid range (1 - 65535).`,
       };
     }
   }
@@ -98,15 +187,53 @@ export function validateTarget(
 }
 
 /**
- * Lightweight In-Memory Sliding-Window Rate Limiter & Concurrency Guard
+ * Anti-DNS-Rebinding asynchronous validator
+ * Resolves a hostname and confirms none of its A/AAAA records point to prohibited metadata
  */
-class RateLimiter {
+export async function validateTargetWithDnsCheck(
+  host: string,
+  port?: number,
+  url?: string,
+  options: TargetPolicyOptions = { allowLocalhost: true, allowPrivateNetworks: true }
+): Promise<TargetValidationResult> {
+  // First run synchronous checks
+  const syncResult = validateTarget(host, port, url, options);
+  if (!syncResult.allowed) return syncResult;
+
+  const targetHost = syncResult.sanitizedHost || host;
+
+  // If already an IP or localhost, no rebinding resolution needed
+  if (net.isIP(targetHost) || targetHost === "localhost") {
+    return syncResult;
+  }
+
+  try {
+    const resolvedIps = await dns.resolve(targetHost).catch(() => []);
+    for (const ip of resolvedIps) {
+      if (isCloudMetadataIp(ip)) {
+        return {
+          allowed: false,
+          rejectionReason: `DNS Rebinding Detected: Hostname '${targetHost}' resolves to prohibited metadata IP '${ip}'.`,
+        };
+      }
+    }
+  } catch {
+    // If resolution fails here, the DNS probe will naturally capture it
+  }
+
+  return syncResult;
+}
+
+/**
+ * Sliding-Window Rate Limiter & Concurrency Guard
+ */
+class SecurityLimiter {
   private requests: Map<string, number[]> = new Map();
   private maxRequestsPerMinute: number;
   private activeConcurrency = 0;
   private maxConcurrency: number;
 
-  constructor(maxPerMin = 40, maxConcurrent = 5) {
+  constructor(maxPerMin = 60, maxConcurrent = 10) {
     this.maxRequestsPerMinute = maxPerMin;
     this.maxConcurrency = maxConcurrent;
   }
@@ -142,6 +269,11 @@ class RateLimiter {
       this.activeConcurrency--;
     }
   }
+
+  public resetForTesting(): void {
+    this.requests.clear();
+    this.activeConcurrency = 0;
+  }
 }
 
-export const securityLimiter = new RateLimiter();
+export const securityLimiter = new SecurityLimiter();

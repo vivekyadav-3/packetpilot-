@@ -119,14 +119,15 @@ apiRouter.get("/history/:id", async (req: Request, res: Response) => {
   }
 });
 
-// Individual Probes
+// Individual Probes with Target Validation
 apiRouter.get("/probe/local-port", async (req: Request, res: Response) => {
   const portStr = getSingleQueryString(req.query.port);
   const port = parseInt(portStr || "", 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
-    return res.status(400).json({ error: "Invalid port number" });
+  const validation = validateTarget("localhost", port);
+  if (!validation.allowed) {
+    return res.status(403).json({ error: validation.rejectionReason });
   }
-  const result = await inspectLocalPort(port);
+  const result = await inspectLocalPort(validation.sanitizedPort!);
   return res.json(result);
 });
 
@@ -134,10 +135,11 @@ apiRouter.get("/probe/tcp", async (req: Request, res: Response) => {
   const host = getSingleQueryString(req.query.host) || "localhost";
   const portStr = getSingleQueryString(req.query.port);
   const port = parseInt(portStr || "", 10);
-  if (isNaN(port)) {
-    return res.status(400).json({ error: "Invalid port number" });
+  const validation = validateTarget(host, port);
+  if (!validation.allowed) {
+    return res.status(403).json({ error: validation.rejectionReason });
   }
-  const result = await checkTcpPort({ host, port });
+  const result = await checkTcpPort({ host: validation.sanitizedHost!, port: validation.sanitizedPort! });
   return res.json(result);
 });
 
@@ -146,7 +148,11 @@ apiRouter.get("/probe/dns", async (req: Request, res: Response) => {
   if (!host) {
     return res.status(400).json({ error: "Host parameter is required" });
   }
-  const result = await resolveDns(host);
+  const validation = validateTarget(host);
+  if (!validation.allowed) {
+    return res.status(403).json({ error: validation.rejectionReason });
+  }
+  const result = await resolveDns(validation.sanitizedHost!);
   return res.json(result);
 });
 
@@ -155,7 +161,11 @@ apiRouter.get("/probe/http", async (req: Request, res: Response) => {
   if (!url) {
     return res.status(400).json({ error: "URL parameter is required" });
   }
-  const result = await checkHttp(url);
+  const validation = validateTarget("localhost", undefined, url);
+  if (!validation.allowed) {
+    return res.status(403).json({ error: validation.rejectionReason });
+  }
+  const result = await checkHttp(validation.sanitizedUrl!);
   return res.json(result);
 });
 
@@ -166,7 +176,11 @@ apiRouter.get("/probe/tls", async (req: Request, res: Response) => {
   if (!host) {
     return res.status(400).json({ error: "Host parameter is required" });
   }
-  const result = await inspectTls(host, port);
+  const validation = validateTarget(host, port);
+  if (!validation.allowed) {
+    return res.status(403).json({ error: validation.rejectionReason });
+  }
+  const result = await inspectTls(validation.sanitizedHost!, validation.sanitizedPort!);
   return res.json(result);
 });
 

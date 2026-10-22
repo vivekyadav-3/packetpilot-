@@ -328,3 +328,72 @@ test("Storage Concurrency: handles concurrent save operations without lost write
   const history = await DiagnosticHistory.getRuns(20);
   assert.strictEqual(history.length, 10, "All 10 concurrent writes must be safely persisted without data loss");
 });
+
+// ============================================================================
+// PART 5: EXPANDED SECURITY & RATE LIMITING SUITE
+// ============================================================================
+
+test("Security Policy: blocks IPv6 link-local and AWS IPv6 metadata", () => {
+  const ipv6Meta = validateTarget("fd00:ec2::254", 80);
+  assert.strictEqual(ipv6Meta.allowed, false);
+
+  const ipv6LinkLocal = validateTarget("fe80::1ff:feee:a", 80);
+  assert.strictEqual(ipv6LinkLocal.allowed, false);
+});
+
+test("Security Policy: restricts private RFC1918 ranges when allowPrivateNetworks is false", () => {
+  const rfc1918Check = validateTarget("10.0.0.1", 8080, undefined, { allowPrivateNetworks: false });
+  assert.strictEqual(rfc1918Check.allowed, false);
+  assert.ok(rfc1918Check.rejectionReason?.includes("private network"));
+
+  const cgnatCheck = validateTarget("100.64.0.1", 8080, undefined, { allowPrivateNetworks: false });
+  assert.strictEqual(cgnatCheck.allowed, false);
+});
+
+test("Security Limiter: enforces sliding-window rate limit", () => {
+  securityLimiter.resetForTesting();
+  const testIp = "192.0.2.100";
+
+  for (let i = 0; i < 60; i++) {
+    const res = securityLimiter.checkRateLimit(testIp);
+    assert.strictEqual(res.allowed, true);
+  }
+
+  // 61st request in the same minute must be rejected
+  const blockedRes = securityLimiter.checkRateLimit(testIp);
+  assert.strictEqual(blockedRes.allowed, false);
+  assert.ok(blockedRes.retryAfterSeconds && blockedRes.retryAfterSeconds > 0);
+  securityLimiter.resetForTesting();
+});
+
+test("Security Limiter: manages active concurrency slots", () => {
+  securityLimiter.resetForTesting();
+  // Acquire max slots (10)
+  for (let i = 0; i < 10; i++) {
+    assert.strictEqual(securityLimiter.acquireConcurrency(), true);
+  }
+  // 11th should be denied
+  assert.strictEqual(securityLimiter.acquireConcurrency(), false);
+
+  // Release one slot
+  securityLimiter.releaseConcurrency();
+  assert.strictEqual(securityLimiter.acquireConcurrency(), true);
+  securityLimiter.resetForTesting();
+});
+
+test("Deterministic HTTP Timeout: handles server stalling beyond timeout", async () => {
+  const server = http.createServer((_req, _res) => {
+    // Deliberately stall response
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as net.AddressInfo;
+  const testUrl = `http://127.0.0.1:${address.port}/stall`;
+
+  try {
+    const res = await checkHttp(testUrl, 200); // 200ms timeout
+    assert.strictEqual(res.status, "FAILED");
+    assert.ok(res.error?.includes("timed out"));
+  } finally {
+    server.close();
+  }
+});

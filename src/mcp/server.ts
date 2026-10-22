@@ -7,6 +7,7 @@ import { inspectLocalPort } from "../diagnostics/local-port.js";
 import { checkHttp } from "../diagnostics/http.js";
 import { inspectTls } from "../diagnostics/tls.js";
 import { runFullDiagnostic } from "../engine/report.js";
+import { validateTarget } from "../security/target-policy.js";
 
 // Initialize MCP Server
 const server = new McpServer({
@@ -22,7 +23,11 @@ server.tool(
     port: z.number().int().min(1).max(65535).describe("Port number to inspect (e.g., 3000, 5000, 8080)"),
   },
   async ({ port }) => {
-    const result = await inspectLocalPort(port);
+    const val = validateTarget("localhost", port);
+    if (!val.allowed) {
+      return { isError: true, content: [{ type: "text", text: `Security Policy: ${val.rejectionReason}` }] };
+    }
+    const result = await inspectLocalPort(val.sanitizedPort!);
     return {
       content: [
         {
@@ -44,7 +49,11 @@ server.tool(
     timeoutMs: z.number().optional().describe("Connection timeout in milliseconds (default: 3000)"),
   },
   async ({ host, port, timeoutMs }) => {
-    const result = await checkTcpPort({ host, port, timeoutMs });
+    const val = validateTarget(host, port);
+    if (!val.allowed) {
+      return { isError: true, content: [{ type: "text", text: `Security Policy: ${val.rejectionReason}` }] };
+    }
+    const result = await checkTcpPort({ host: val.sanitizedHost!, port: val.sanitizedPort!, timeoutMs });
     return {
       content: [
         {
@@ -64,7 +73,11 @@ server.tool(
     hostname: z.string().describe("Hostname to resolve (e.g. google.com, localhost)"),
   },
   async ({ hostname }) => {
-    const result = await resolveDns(hostname);
+    const val = validateTarget(hostname);
+    if (!val.allowed) {
+      return { isError: true, content: [{ type: "text", text: `Security Policy: ${val.rejectionReason}` }] };
+    }
+    const result = await resolveDns(val.sanitizedHost!);
     return {
       content: [
         {
@@ -85,7 +98,11 @@ server.tool(
     timeoutMs: z.number().optional().describe("Request timeout in milliseconds (default: 5000)"),
   },
   async ({ url, timeoutMs }) => {
-    const result = await checkHttp(url, timeoutMs);
+    const val = validateTarget("localhost", undefined, url);
+    if (!val.allowed) {
+      return { isError: true, content: [{ type: "text", text: `Security Policy: ${val.rejectionReason}` }] };
+    }
+    const result = await checkHttp(val.sanitizedUrl!, timeoutMs);
     return {
       content: [
         {
@@ -107,7 +124,11 @@ server.tool(
     timeoutMs: z.number().optional().describe("Handshake timeout in milliseconds (default: 4000)"),
   },
   async ({ hostname, port, timeoutMs }) => {
-    const result = await inspectTls(hostname, port || 443, timeoutMs);
+    const val = validateTarget(hostname, port || 443);
+    if (!val.allowed) {
+      return { isError: true, content: [{ type: "text", text: `Security Policy: ${val.rejectionReason}` }] };
+    }
+    const result = await inspectTls(val.sanitizedHost!, val.sanitizedPort!, timeoutMs);
     return {
       content: [
         {
@@ -129,7 +150,15 @@ server.tool(
     url: z.string().optional().describe("Full URL to test HTTP layer (e.g. http://localhost:5000)"),
   },
   async ({ host, port, url }) => {
-    const report = await runFullDiagnostic({ host, port, url });
+    const val = validateTarget(host, port, url);
+    if (!val.allowed) {
+      return { isError: true, content: [{ type: "text", text: `Security Policy: ${val.rejectionReason}` }] };
+    }
+    const report = await runFullDiagnostic({
+      host: val.sanitizedHost || host,
+      port: val.sanitizedPort ?? port,
+      url: val.sanitizedUrl ?? url,
+    });
     return {
       content: [
         {
